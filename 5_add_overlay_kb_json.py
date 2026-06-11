@@ -13,12 +13,23 @@ import gradio as gr
 from openai import OpenAI
 from dotenv import load_dotenv
 from datetime import datetime
+import re
+
+# 기존 import 아래에 추가
+from sentence_transformers import CrossEncoder
+
+# 환경 설정(client = OpenAI(...) 등) 아래에 추가
+print("Reranker 모델을 로드하는 중입니다... (최초 실행 시 다운로드로 인해 시간이 걸릴 수 있습니다)")
+reranker = CrossEncoder("Dongjin-kr/ko-reranker")
 
 # =========================
 # 환경 설정
 # =========================
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(
+    base_url="http://localhost:11434/v1",  # 로컬 Ollama 서버 주소
+    api_key="ollama"  # Ollama는 키 검증을 하지 않으므로 임의의 값 입력
+)
 
 EMBEDDED_JSON = "guide_step5_embedded_chunk.json"
 QA_CACHE_JSON = "qa_cache.json"
@@ -40,12 +51,15 @@ def cosine_similarity(a, b):
 
 
 def normalize_question(q: str):
-    return q.strip().lower().replace("?", "").replace(" ", "")
+    q = q.strip().lower()
+    q = re.sub(r'[^\w\s가-힣]', '', q)
+    q = re.sub(r'\s+', ' ', q)
+    return q.strip()
 
 
 def embed_query(text: str):
     res = client.embeddings.create(
-        model="text-embedding-3-large",
+        model="bge-m3",  # 👈 본인이 설치한 모델 이름으로 변경
         input=text
     )
     return res.data[0].embedding
@@ -77,13 +91,34 @@ def search_chunks(query: str):
     chunks = load_json(EMBEDDED_JSON, [])
     q_emb = embed_query(normalize_question(query))
 
+    # [1단계] 임베딩(코사인 유사도) 기반 초벌 검색: 넉넉하게 상위 15개 추출
     scored = []
     for chunk in chunks:
         score = cosine_similarity(q_emb, chunk["embedding"])
         scored.append((score, chunk))
 
     scored.sort(key=lambda x: x[0], reverse=True)
-    return scored[:TOP_K]
+    top_15_chunks = scored[:15]
+
+    if not top_15_chunks:
+        return []
+
+    # [2단계] Reranker 기반 정밀 재평가 (Cross-Encoder)
+    # Reranker 입력 형태: [[질문, 문서내용1], [질문, 문서내용2], ...]
+    cross_input = [[query, c[1]["content"]] for c in top_15_chunks]
+    
+    # 모델을 통해 연관성 점수 다시 계산 (점수가 높을수록 연관성이 높음)
+    rerank_scores = reranker.predict(cross_input)
+    
+    # 새로운 Reranker 점수를 기준으로 문서와 매칭하여 재배열
+    reranked = []
+    for i, score in enumerate(rerank_scores):
+        reranked.append((float(score), top_15_chunks[i][1]))
+        
+    reranked.sort(key=lambda x: x[0], reverse=True)
+    
+    # 최종적으로 가장 관련성 높은 핵심 문서 3개만 반환
+    return reranked[:3]
 
 
 def build_context(chunks):
@@ -95,14 +130,18 @@ def build_context(chunks):
 
 def generate_answer(query: str, context: str):
     res = client.chat.completions.create(
-        model="gpt-4.1-mini",
+        model="llama3",  # 또는 설치하신 모델명 (예: llama3.1)
         messages=[
             {
                 "role": "system",
                 "content": (
-                    "너는 Gradio 기반 웹 UI 사용법을 안내하는 도우미다. "
-                    "반드시 제공된 문서 내용만 사용해서 답변해라. "
-                    "문서에 없는 내용은 추측하지 말고 '문서에 없는 내용입니다'라고 답해라."
+                    "당신은 제공된 문서를 바탕으로 사용자의 질문에 답변하는 전문 AI 도우미입니다.\n"
+                    "아래의 [지시사항]을 엄격하게 준수하여 답변하세요.\n\n"
+                    "### 지시사항:\n"
+                    "1. 반드시 제공된 [문서 컨텍스트]에 있는 정보만 사용하여 답변하세요.\n"
+                    "2. 컨텍스트에 질문과 관련된 정보가 아예 없다면, 오직 \"제공된 문서에서는 해당 내용을 찾을 수 없습니다.\" 라고 **단 한 번만** 말하고 답변을 종료하세요. 절대 같은 문장을 반복하지 마세요.\n"
+                    "3. 답변이 길어질 경우 글머리 기호(-, 1. 2.)나 굵은 글씨 등 마크다운(Markdown)을 활용하여 가독성 있게 정리하세요.\n"
+                    "4. 모든 대답은 반드시 한국어(Korean)로만 작성하세요."
                 )
             },
             {
@@ -110,7 +149,7 @@ def generate_answer(query: str, context: str):
                 "content": f"[문서 컨텍스트]\n{context}\n\n[질문]\n{query}"
             }
         ],
-        temperature=0
+        temperature=0.1 # 0은 너무 뻣뻣해질 수 있어 0.1 정도로 살짝 올리는 것도 좋습니다.
     )
     return res.choices[0].message.content
 
